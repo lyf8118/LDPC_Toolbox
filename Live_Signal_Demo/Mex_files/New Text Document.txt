@@ -1,0 +1,200 @@
+
+/*================================================================================
+ * Filename: gpuCorrelatorMex.cpp
+ * Description: This function implements the GPU correlation function for tracking loops.
+ *
+ * Authors: Yafeng Li (School of Automation, Beijing Information Science and Technology University)
+ * Time: Feb, 20, 2020
+ *
+ * Input:
+ *          float   *rawSignal          I   Input IF signal
+ *          float   *caCode             I   GPS L1 C / A code sequence
+ *          double  samplingPhase       I   carrier sampling interval(cycle : Hz * t)
+ *          double  remCarrPhase        I   initial phase(rad)
+ *          double  remCodePhase        I   initial code phase(chips)
+ *          double  codePhaseStep       I   code sampling interval(chips)
+ *          double  inPRN               I   SV number
+ *          double  codePhaseOffset     I   half of the early-late code correlation spacing(chips)
+ *          double  *corrValues         O   outputs of correlator values
+ * Output:
+ *          double *corrValues: outputs of correlator values
+ *==============================================================================*/
+
+#include "mex.h"
+#include <math.h>
+#include <string>
+#include <complex>
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+// Kernal configuration
+#define THREADSPERBLOCK 1024
+// Number of correlator branches: Early, Prompt, and Late
+#define CORR_NUMBER 3        
+#define ACCUM_N 1024
+
+/* ========== GPU internal data types for complex numbers ========== */
+struct GPU_Complex
+{
+    float r;
+    float i;
+
+    __host__ __device__ GPU_Complex() {}
+
+    // Constructor for a complex number with real and imag parts of float
+    __host__ __device__ GPU_Complex(float a, float b) : r(a), i(b) {}
+
+    // Magnitude of a complex number
+    __host__ __device__ float magnitude2(void) { return r * r + i * i; }
+
+    __device__ GPU_Complex operator*(const GPU_Complex& a) {
+        return GPU_Complex(__fmul_rn(r, a.r) - __fmul_rn(i, a.i), __fmul_rn(i, a.r) + __fmul_rn(r, a.i));
+    }
+
+    __device__ GPU_Complex operator*(const float& a) {
+        return GPU_Complex(__fmul_rn(r, a), __fmul_rn(i, a));
+    }
+
+    __host__ __device__ GPU_Complex operator+(const GPU_Complex& a) {
+        return GPU_Complex(r + a.r, i + a.i);
+    }
+
+    __host__ __device__ void operator+=(const GPU_Complex& a) {
+        r += a.r;
+        i += a.i;
+    }
+
+    __device__ void multiply_acc(const GPU_Complex& a, const GPU_Complex& b) {
+        // real part
+        r = __fmaf_rn(a.r, b.r, r);
+        r = __fmaf_rn(-a.i, b.i, r);
+        // imag part
+        i = __fmaf_rn(a.i, b.r, i);
+        i = __fmaf_rn(a.r, b.i, i);
+    }
+
+    __device__ void multiply_acc(const GPU_Complex& a, const float& b) {
+        // real part
+        r = __fmaf_rn(a.r, b, r);
+        // imag part
+        i = __fmaf_rn(a.i, b, i);
+    }
+};
+
+#define CHECK(call)                                                            \
+{                                                                              \
+    auto error = call;                                                         \
+    if (error != cudaSuccess)                                                  \
+    {                                                                          \
+        mexPrintf("   CUDA error: %s\n", cudaGetErrorString(error));           \
+    }                                                                          \
+}
+
+/* ===================== Declare functions and variables ===================== */
+__global__ void mixCarrReal(float*, GPU_Complex*, int, float, float);
+__global__ void mixCarrComplex(float*, GPU_Complex*, int, float, float);
+__global__ void correlator(GPU_Complex*, GPU_Complex*, float*, float, int, float, float, int);
+void cleanup(void);
+
+/* ---------- To preserve variables between mex function calls ---------- */
+static float * d_pRawSignal, ** d_ppCaCode;
+static GPU_Complex **d_ppBasebandSignal, * d_corrValues;
+std::complex<float>* h_corrValues;
+static cudaStream_t* streams;
+static size_t channelCnt;
+
+/* The gateway function --------------------------------------------------------
+ * Args   : float  *rawSignal          I   Input IF signal
+ *          float  *caCode             I   GPS L1 C/A code sequence
+ *          double samplingPhase       I   carrier sampling interval (cycle: Hz*t)
+ *          double remCarrPhase        I   initial phase (rad)
+ *          double remCodePhase        I   initial code phase(chips)
+ *          double codePhaseStep       I   code sampling interval(chips)
+ *          double inPRN               I   SV number
+ *          double codePhaseOffset     I   half of the early - late code correlation spacing(chips)
+ *          double inPRN               I   SV PRN number
+ *          double *corrValues         O   outputs of correlator values
+ *
+ * Return : double *corrValues
+ *------------------------------------------------------------------------------*/
+void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[])
+{
+    /* --------------- Declare all variables --------------- */
+    float* rawSignal, * caCodeTable;
+    int* startIndex, * chSampleSize;
+    double* remCarrPhase, * carrPhaseStep, * remCodePhase, * codePhaseStep;
+    double earlyLateSpc;
+    double* correValues;
+    size_t blksize;
+    static size_t codeLen;
+    int dataReadFlag;
+    static int fileType;
+
+    /* ----------------- Get input arrays ------------------- */
+    remCarrPhase = mxGetPr(prhs[2]);
+    carrPhaseStep = mxGetPr(prhs[3]);
+    remCodePhase = mxGetPr(prhs[4]);
+    codePhaseStep = mxGetPr(prhs[5]);
+    earlyLateSpc = mxGetScalar(prhs[6]);
+    startIndex = (int*)mxGetData(prhs[7]);
+    chSampleSize = (int*)mxGetData(prhs[8]);
+    dataReadFlag = (int)mxGetScalar(prhs[9]);
+
+    static int rawSignalLen;
+    static int initialized = 0;
+    static size_t pitchCarr, blockPerGrid;
+
+    /* ================ Allocate host/device memory and initialize variables ================= */
+    if (!initialized)
+    {
+        /* ------ Get array dimensions ----- */
+        codeLen = mxGetM(prhs[1]);
+        channelCnt = mxGetN(prhs[1]);
+        fileType = (int)mxGetScalar(prhs[10]);
+
+        caCodeTable = (float*)mxGetData(prhs[1]);
+        d_ppCaCode = (float**)malloc(sizeof(float*) * channelCnt);
+        d_ppBasebandSignal = (GPU_Complex**)malloc(sizeof(GPU_Complex*) * channelCnt);
+        blksize = chSampleSize[0];
+        mwIndex dims[2] = { 0, 0 };
+        for (int chInd = 0; chInd < channelCnt; chInd++)
+        {
+            dims[1] = chInd;
+            size_t index = mxCalcSingleSubscript(prhs[1], (size_t)2, dims);
+            float* caCode = &caCodeTable[index];
+            CHECK(cudaMalloc(&d_ppCaCode[chInd], sizeof(float) * codeLen));
+            CHECK(cudaMemcpy(d_ppCaCode[chInd], caCode, codeLen * sizeof(float), cudaMemcpyHostToDevice));
+            CHECK(cudaMalloc(&d_ppBasebandSignal[chInd], sizeof(GPU_Complex) * (blksize + 100)));
+        }
+
+        blockPerGrid = (int)(blksize + 100 + THREADSPERBLOCK) / THREADSPERBLOCK;
+
+        rawSignalLen = mxGetM(prhs[0]);
+        CHECK(cudaMalloc(&d_pRawSignal, rawSignalLen * sizeof(float)));
+
+        CHECK(cudaHostAlloc(&h_corrValues, CORR_NUMBER * channelCnt * sizeof(std::complex<float>), cudaHostAllocMapped));
+        CHECK(cudaHostGetDevicePointer(&d_corrValues, h_corrValues, 0));
+
+        streams = (cudaStream_t*)malloc(channelCnt * sizeof(cudaStream_t));
+        for (int chInd = 0; chInd < channelCnt; chInd++) {
+            CHECK(cudaStreamCreate(&streams[chInd]));
+        }
+
+        mexAtExit(cleanup);
+        initialized = 1;
+        printf("   CUDA initialized ...\n");
+    }
+
+    /* -------- Initialize output array --------- */
+    plhs[0] = mxCreateDoubleMatrix((mwSize)6, (mwSize)channelCnt, mxREAL);
+    correValues = (double*)mxGetData(plhs[0]);
+
+    /* ========================= GPU correlator implementation  ========================= */
+    if (dataReadFlag == 1) 
+    {
+        rawSignal = (float*)mxGetData(prhs[0]);
+        cudaMemcpy(d_pRawSignal, rawSignal, rawSignalLen * sizeof(float), cudaMemcpyHostToDevice);
+    }
+
+    /* --------- Implement correlation streams --------- */
+    for (int chInd = 0; chInd < channelCnt; chInd
