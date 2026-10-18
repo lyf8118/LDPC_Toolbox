@@ -6,7 +6,7 @@ An Open-Source MATLAB GNSS LDPC Decoding and Analysis Toolbox
 
 Overview
 -------------------------------------------------------------------------------
-GLDA is an open-source MATLAB toolbox for the simulation, implementation, and performance analysis of low-density parity-check (LDPC) decoding for GNSS navigation messages. It provides binary LDPC processing for GPS L1C CNAV-2 and non-binary GF(64) LDPC processing for BDS-3 B1C, B2a, and B2b. Conventional decoders and model-driven neural variants are organized in separate algorithm folders so that they can be evaluated under a common Monte Carlo framework. The toolbox supports both symbol-level simulation and sample-level real-IF
+GNSS-LDPC-Toolbox is an open-source MATLAB toolbox for the simulation, implementation, and performance analysis of low-density parity-check (LDPC) decoding for GNSS navigation messages. It provides binary LDPC processing for GPS L1C CNAV-2 and non-binary GF(64) LDPC processing for BDS-3 B1C, B2a, and B2b. Conventional decoders and model-driven neural variants are organized in separate algorithm folders so that they can be evaluated under a common Monte Carlo framework. The toolbox supports both symbol-level simulation and sample-level real-IF
 waveform simulation. The symbol-level path provides a fast statistical baseline for decoder studies. The sample-level path includes signal-specific spreading and modulation, a real intermediate-frequency carrier, AWGN, complex down-conversion, front-end low-pass filtering, correlation, and noise estimation. The repository also contains experimental GPS L1C and BDS-3 B2b software-receiver chains for recorded signals, together with MATLAB, SIMD MEX, and CUDA MEX
 correlator backends.
 
